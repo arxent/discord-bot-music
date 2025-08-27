@@ -14,6 +14,6 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . /app
 
 # Expose port 8990 (listener di dalam container)
-EXPOSE 8990
+EXPOSE 8111
 
 CMD ["python", "bot.py"]
