@@ -1,7 +1,7 @@
 version: "3.9"
 services:
   musicbot:
-    build: ./repo
+    build: .
     container_name: musicbot
     restart: unless-stopped
     env_file:
