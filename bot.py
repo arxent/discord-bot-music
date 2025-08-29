@@ -440,7 +440,12 @@ async def clear_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="loop", description="Set or show loop mode (off/track/queue)")
 @app_commands.describe(mode="Loop mode (off/track/queue)")
-async def loop_cmd(interaction: discord.Interaction, mode: Optional[Literal["off","track","queue"]] = None):
+@app_commands.choices(mode=[
+    app_commands.Choice(name="off", value="off"),
+    app_commands.Choice(name="track", value="track"),
+    app_commands.Choice(name="queue", value="queue"),
+])
+async def loop_cmd(interaction: discord.Interaction, mode: Optional[app_commands.Choice[str]] = None):
     assert interaction.guild is not None
     gp = get_player(interaction.guild.id)
 
@@ -449,11 +454,11 @@ async def loop_cmd(interaction: discord.Interaction, mode: Optional[Literal["off
         await interaction.response.send_message(f"🔁 Loop mode: {status}.")
         return
 
-    if mode == "off":
+    if mode.value == "off":
         gp.loop_one = False
         gp.loop_all = False
         msg = "🔁 Loop disabled."
-    elif mode == "track":
+    elif mode.value == "track":
         gp.loop_one = True
         gp.loop_all = False
         msg = "🔂 Looping current track."
