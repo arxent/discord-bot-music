@@ -247,7 +247,7 @@ async def update_presence(title: Optional[str]) -> None:
         if title:
             await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=title))
         else:
-            await bot.change_presence(activity=None)
+            await bot.change_presence(activity=discord.Game(name="/play to play music"))
     except Exception:
         pass
 
@@ -296,6 +296,8 @@ async def on_ready():
     except Exception as e:
         print(f"Slash sync failed: {e}")
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    # Set idle presence on startup
+    await update_presence(None)
 
 @bot.tree.command(name="ping", description="Check if the bot is responsive")
 async def ping(interaction: discord.Interaction):
