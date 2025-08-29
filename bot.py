@@ -3,6 +3,7 @@ import re
 import asyncio
 import time
 import random
+import math
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Literal
 
@@ -125,6 +126,7 @@ class GuildPlayer:
 
 # ------------- Helpers -------------
 YOUTUBE_URL_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+")
+YOUTUBE_PLAYLIST_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be)/.*(?:[?&])list=([A-Za-z0-9_-]+)")
 SPOTIFY_URL_RE = re.compile(r"https?://open\.spotify\.com/(track|playlist)/[A-Za-z0-9]+")
 
 _spotify_client: Optional["spotipy.Spotify"] = None
@@ -221,6 +223,33 @@ async def resolve_spotify_to_query(url: str) -> List[str]:
     else:
         items.append(url)
     return items
+
+async def expand_youtube_playlist(url: str, limit: int = 50) -> List[str]:
+    """Return a list of video watch URLs from a YouTube playlist (flat, no download)."""
+    loop = asyncio.get_running_loop()
+
+    def _extract():
+        opts = YTDL_OPTS.copy()
+        opts["extract_flat"] = True
+        opts["noplaylist"] = False
+        opts["playlistend"] = limit
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            entries = info.get("entries") or []
+            urls: List[str] = []
+            for e in entries:
+                u = e.get("url") or e.get("id")
+                if not u:
+                    continue
+                if not u.startswith("http"):
+                    u = f"https://www.youtube.com/watch?v={u}"
+                urls.append(u)
+            return urls
+
+    try:
+        return await loop.run_in_executor(None, _extract)
+    except Exception:
+        return []
 
 async def make_track(query_or_url: str, requested_by_id: int, requested_by_name: str) -> Track:
     # Accept YouTube URL, plain query, or Spotify URL (resolve to YouTube search)
@@ -319,9 +348,56 @@ async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
     try:
         gp = await ensure_voice(interaction)
-        # remember channel for now-playing announcements
         gp.announce_channel_id = interaction.channel.id if interaction.channel else None
 
+        # Auto-detect YouTube playlist and expand into queue
+        if YOUTUBE_PLAYLIST_RE.search(query):
+            video_urls = await expand_youtube_playlist(query, limit=50)
+            if video_urls:
+                # Find first playable track
+                first_track: Optional[Track] = None
+                first_idx: int = -1
+                for idx, vu in enumerate(video_urls):
+                    try:
+                        cand = await make_track(vu, requested_by_id=interaction.user.id, requested_by_name=interaction.user.display_name)
+                        await gp.queue.put(cand)
+                        first_track = cand
+                        first_idx = idx
+                        break
+                    except Exception:
+                        continue  # skip unavailable video
+
+                if first_track is None:
+                    await interaction.followup.send("❌ Couldn't queue any playable tracks from that playlist.")
+                    return
+
+                # Enqueue the rest, skipping any unavailable ones
+                enqueued_rest = 0
+                for j, vu in enumerate(video_urls):
+                    if j == first_idx:
+                        continue
+                    try:
+                        t = await make_track(vu, requested_by_id=interaction.user.id, requested_by_name=interaction.user.display_name)
+                        await gp.queue.put(t)
+                        enqueued_rest += 1
+                    except Exception:
+                        continue
+
+                await gp.ensure_player(bot, interaction.guild)
+                more = f"… ({enqueued_rest}) more" if enqueued_rest else ""
+                msg = (
+                    "✅ Playlist detected. Now queued to start with: "
+                    f"\n**[{first_track.title}]({first_track.webpage_url})** — requested by <@{interaction.user.id}>"
+                    + more
+                )
+                await interaction.followup.send(msg)
+                return
+            else:
+                await interaction.followup.send("❌ Couldn't read that playlist URL.")
+                return
+            # fallback to normal if extraction failed
+
+        # Normal single track / URL / query flow
         track = await make_track(query, requested_by_id=interaction.user.id, requested_by_name=interaction.user.display_name)
         await gp.queue.put(track)
         await gp.ensure_player(bot, interaction.guild)
@@ -346,9 +422,12 @@ async def spotify_cmd(interaction: discord.Interaction, query: str):
             queries = await resolve_spotify_to_query(query)
             titles_links: List[Tuple[str, str]] = []
             for q in queries[:50]:  # limit to avoid spam
-                t = await make_track(q, requested_by_id=interaction.user.id, requested_by_name=interaction.user.display_name)
-                await gp.queue.put(t)
-                titles_links.append((t.title, t.webpage_url))
+                try:
+                    t = await make_track(q, requested_by_id=interaction.user.id, requested_by_name=interaction.user.display_name)
+                    await gp.queue.put(t)
+                    titles_links.append((t.title, t.webpage_url))
+                except Exception:
+                    continue
             await gp.ensure_player(bot, interaction.guild)
             added = len(titles_links)
             if added:
@@ -640,6 +719,95 @@ async def nowplaying_cmd(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
+# --- Queue pagination helpers ---
+class QueuePaginator(discord.ui.View):
+    def __init__(self, requester_id: int, now_playing: Optional[Track], play_started_at: Optional[float], pending: List[Track], per_page: int = 10, timeout: Optional[float] = 120):
+        super().__init__(timeout=timeout)
+        self.requester_id = requester_id
+        self.now_playing = now_playing
+        self.play_started_at = play_started_at
+        self.pending = pending
+        self.per_page = per_page
+        self.page = 0
+        self.total_pages = (len(self.pending) + self.per_page - 1) // self.per_page if self.pending else 1
+        self._update_buttons()
+
+    def _fmt(self, s: int) -> str:
+        h, rem = divmod(s, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    def _render(self) -> str:
+        sections: List[str] = []
+        # Now playing
+        if self.now_playing:
+            t = self.now_playing
+            elapsed = 0
+            if self.play_started_at is not None:
+                try:
+                    elapsed = max(0, int(time.monotonic() - self.play_started_at))
+                except Exception:
+                    elapsed = 0
+            if t.duration:
+                elapsed = min(elapsed, t.duration)
+                ts = f"[{self._fmt(elapsed)}/{self._fmt(t.duration)}]"
+            else:
+                ts = f"[{self._fmt(elapsed)}]"
+            sections.append(f"🎵 Now Playing: **{t.title}** {ts} — requested by <@{t.requested_by_id}>\n")
+
+        if not self.pending:
+            sections.append("Up next: (empty)")
+            return "".join(sections)
+
+        start = self.page * self.per_page
+        end = start + self.per_page
+        slice_ = self.pending[start:end]
+
+        up_next_lines = [f"**Up next** (page {self.page + 1}/{self.total_pages}):"]
+        for idx, it in enumerate(slice_, start=start + 1):
+            up_next_lines.append(f"\n{idx}. **{it.title}** — requested by <@{it.requested_by_id}>")
+        if end < len(self.pending):
+            up_next_lines.append(f"\n…{len(self.pending) - end} more queued")
+        sections.append("".join(up_next_lines))
+        return "".join(sections)
+
+    def _update_buttons(self):
+        # Ensure buttons are in correct enabled/disabled state
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.custom_id == "prev":
+                    child.disabled = (self.page <= 0)
+                elif child.custom_id == "next":
+                    child.disabled = (self.page >= self.total_pages - 1)
+
+    async def _maybe_block(self, interaction: discord.Interaction) -> bool:
+        # Only allow the original requester to control pagination
+        if interaction.user.id != self.requester_id:
+            try:
+                await interaction.response.send_message("You can't control this paginator.", ephemeral=True)
+            except Exception:
+                pass
+            return True
+        return False
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, custom_id="prev")
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._maybe_block(interaction):
+            return
+        if self.page > 0:
+            self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(content=self._render(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary, custom_id="next")
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._maybe_block(interaction):
+            return
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(content=self._render(), view=self)
+
 @bot.tree.command(name="queue", description="Show the upcoming queue")
 async def queue_cmd(interaction: discord.Interaction):
     assert interaction.guild is not None
@@ -652,49 +820,43 @@ async def queue_cmd(interaction: discord.Interaction):
     except Exception:
         pending = []
 
-    sections: List[str] = []
-
-    # Now Playing (with timestamp)
-    if gp.now_playing:
-        t = gp.now_playing
-        elapsed = 0
-        if gp.play_started_at is not None:
-            try:
-                elapsed = max(0, int(time.monotonic() - gp.play_started_at))
-            except Exception:
-                elapsed = 0
-        def fmt(s: int) -> str:
-            h, rem = divmod(s, 3600)
-            m, s = divmod(rem, 60)
-            return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-        ts = f"[{fmt(min(elapsed, t.duration))}/{fmt(t.duration)}]" if t.duration else f"[{fmt(elapsed)}]"
-        sections.append(
-            "".join([
-                "🎵 Now Playing: ",
-                f"**{t.title}** {ts} — requested by <@{t.requested_by_id}>\n",
-            ])
-        )
-
-    # If nothing queued and nothing playing
-    if not pending and not sections:
+    if not pending and not gp.now_playing:
         await interaction.response.send_message("Queue is empty.", ephemeral=True)
         return
 
-    # Up next (first 10 items) — each on its own line
-    if pending:
-        up_next_lines = ["**Up next:**"]
-        for idx, it in enumerate(pending[:10], start=1):
-            up_next_lines.append(
-                f"\n{idx}. **{it.title}** — requested by <@{it.requested_by_id}>"
-            )
-        if len(pending) > 10:
-            up_next_lines.append(f"…and {len(pending)-10} more")
-        sections.append("".join(up_next_lines))
-    else:
-        sections.append("Up next: (empty)")
+    # If few items, just print without paginator
+    if len(pending) <= 10:
+        sections: List[str] = []
+        # Now Playing (with timestamp)
+        if gp.now_playing:
+            t = gp.now_playing
+            elapsed = 0
+            if gp.play_started_at is not None:
+                try:
+                    elapsed = max(0, int(time.monotonic() - gp.play_started_at))
+                except Exception:
+                    elapsed = 0
+            def fmt(s: int) -> str:
+                h, rem = divmod(s, 3600)
+                m, s = divmod(rem, 60)
+                return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+            ts = f"[{fmt(min(elapsed, t.duration))}/{fmt(t.duration)}]" if t.duration else f"[{fmt(elapsed)}]"
+            sections.append(f"🎵 Now Playing: **{t.title}** {ts} — requested by <@{t.requested_by_id}>\n")
 
-    content = "".join(sections)
-    await interaction.response.send_message(content)
+        if pending:
+            up_next_lines = ["**Up next:**"]
+            for idx, it in enumerate(pending[:10], start=1):
+                up_next_lines.append(f"\n{idx}. **{it.title}** — requested by <@{it.requested_by_id}>")
+            sections.append("".join(up_next_lines))
+        else:
+            sections.append("Up next: (empty)")
+
+        await interaction.response.send_message("".join(sections))
+        return
+
+    # Many items: use paginator view
+    view = QueuePaginator(requester_id=interaction.user.id, now_playing=gp.now_playing, play_started_at=gp.play_started_at, pending=pending, per_page=10, timeout=180)
+    await interaction.response.send_message(view._render(), view=view)
 
 @bot.tree.command(name="leave", description="Disconnect the bot from voice")
 async def leave(interaction: discord.Interaction):
