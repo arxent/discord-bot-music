@@ -4,7 +4,7 @@ import asyncio
 import time
 import random
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Literal
 
 import discord
 from discord import app_commands
@@ -438,22 +438,22 @@ async def clear_cmd(interaction: discord.Interaction):
             break
     await interaction.response.send_message(f"🧹 Queue cleared. Removed {cleared} tracks.")
 
-@bot.tree.command(name="loop", description="Set loop mode: off, track, or queue")
-@app_commands.describe(mode="Choose loop mode")
-@app_commands.choices(mode=[
-    app_commands.Choice(name="off", value="off"),
-    app_commands.Choice(name="track", value="track"),
-    app_commands.Choice(name="queue", value="queue"),
-])
-async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+@bot.tree.command(name="loop", description="Set or show loop mode (off/track/queue)")
+@app_commands.describe(mode="Loop mode (off/track/queue)")
+async def loop_cmd(interaction: discord.Interaction, mode: Optional[Literal["off","track","queue"]] = None):
     assert interaction.guild is not None
     gp = get_player(interaction.guild.id)
 
-    if mode.value == "off":
+    if mode is None:
+        status = "track" if gp.loop_one else ("queue" if gp.loop_all else "off")
+        await interaction.response.send_message(f"🔁 Loop mode: {status}.")
+        return
+
+    if mode == "off":
         gp.loop_one = False
         gp.loop_all = False
         msg = "🔁 Loop disabled."
-    elif mode.value == "track":
+    elif mode == "track":
         gp.loop_one = True
         gp.loop_all = False
         msg = "🔂 Looping current track."
