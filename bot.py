@@ -69,6 +69,7 @@ class GuildPlayer:
     volume: float = 0.5
     announce_channel_id: Optional[int] = None  # where to announce Now Playing
     loop_one: bool = False
+    loop_all: bool = False
     play_started_at: Optional[float] = None
 
     async def ensure_player(self, bot: commands.Bot, guild: discord.Guild) -> None:
@@ -111,12 +112,14 @@ class GuildPlayer:
 
             await next_event.wait()
             self.now_playing = None
-            # If loop is enabled, put the same track back to the front
+            # If loop is enabled, re-queue accordingly
             if self.loop_one:
                 try:
                     self.queue._queue.appendleft(track)  # type: ignore[attr-defined]
                 except Exception:
                     await self.queue.put(track)
+            elif self.loop_all:
+                await self.queue.put(track)
             if self.queue.empty():
                 await update_presence(None)
 
@@ -435,13 +438,31 @@ async def clear_cmd(interaction: discord.Interaction):
             break
     await interaction.response.send_message(f"🧹 Queue cleared. Removed {cleared} tracks.")
 
-@bot.tree.command(name="loop", description="Toggle looping the current track")
-async def loop_cmd(interaction: discord.Interaction):
+@bot.tree.command(name="loop", description="Set loop mode: off, track, or queue")
+@app_commands.describe(mode="Choose loop mode")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="off", value="off"),
+    app_commands.Choice(name="track", value="track"),
+    app_commands.Choice(name="queue", value="queue"),
+])
+async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
     assert interaction.guild is not None
     gp = get_player(interaction.guild.id)
-    gp.loop_one = not gp.loop_one
-    status = "enabled" if gp.loop_one else "disabled"
-    await interaction.response.send_message(f"🔁 Loop {status}.")
+
+    if mode.value == "off":
+        gp.loop_one = False
+        gp.loop_all = False
+        msg = "🔁 Loop disabled."
+    elif mode.value == "track":
+        gp.loop_one = True
+        gp.loop_all = False
+        msg = "🔂 Looping current track."
+    else:  # queue
+        gp.loop_one = False
+        gp.loop_all = True
+        msg = "🔁 Looping the queue."
+
+    await interaction.response.send_message(msg)
 
 @bot.tree.command(name="remove", description="Remove one or a range of tracks from the queue")
 @app_commands.describe(index="1-based position to remove", end="Optional end position (inclusive) to remove a range")
