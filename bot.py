@@ -15,6 +15,7 @@ from discord.ext import commands
 # Ensure you installed: pip install -U discord.py[voice] yt-dlp spotipy python-dotenv
 import yt_dlp
 from dotenv import load_dotenv
+import aiohttp
 
 # Spotify (optional). If not configured, we still work via YouTube.
 try:
@@ -328,9 +329,62 @@ async def on_ready():
     # Set idle presence on startup
     await update_presence(None)
 
-@bot.tree.command(name="ping", description="Check if the bot is responsive")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong! ✅")
+@bot.tree.command(name="ping", description="Measure latency (gateway & internet)")
+@app_commands.describe(target="What to test: all/gateway/internet")
+@app_commands.choices(target=[
+    app_commands.Choice(name="all", value="all"),
+    app_commands.Choice(name="gateway", value="gateway"),
+    app_commands.Choice(name="internet", value="internet"),
+])
+async def ping(interaction: discord.Interaction, target: Optional[app_commands.Choice[str]] = None):
+    """Show WebSocket (gateway) latency and/or HTTP internet latency in ms."""
+    await interaction.response.defer()
+
+    parts: List[str] = []
+
+    # Gateway (WebSocket) latency from discord.py
+    want_gateway = (target is None) or (target.value in {"all", "gateway"})
+    if want_gateway:
+        ws_ms = int(bot.latency * 1000)
+        parts.append(f"**Gateway** (WebSocket): `{ws_ms} ms`")
+
+    # Internet (HTTP) latency by probing a few fast endpoints
+    want_inet = (target is None) or (target.value in {"all", "internet"})
+    if want_inet:
+        urls = [
+            "https://www.google.com/generate_204",
+            "https://1.1.1.1",  # Cloudflare
+            "https://www.cloudflare.com/cdn-cgi/trace",
+        ]
+        samples: List[int] = []
+        for u in urls:
+            try:
+                t0 = time.perf_counter()
+                # Small timeout to reflect connectivity
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+                    async with session.get(u) as resp:
+                        await resp.read()
+                dt_ms = int((time.perf_counter() - t0) * 1000)
+                samples.append(dt_ms)
+            except Exception:
+                continue
+        if samples:
+            best = min(samples)
+            avg = sum(samples) // len(samples)
+            # Simple quality label
+            if best < 50:
+                label = "excellent"
+            elif best < 100:
+                label = "good"
+            elif best < 200:
+                label = "fair"
+            else:
+                label = "poor"
+            parts.append(f"**Internet** (HTTP): best `{best} ms`, avg `{avg} ms` → {label}")
+        else:
+            parts.append("**Internet** (HTTP): unreachable ❌")
+
+    await interaction.followup.send("".join(parts))
 
 @bot.tree.command(name="join", description="Have the bot join your voice channel")
 async def join(interaction: discord.Interaction):
